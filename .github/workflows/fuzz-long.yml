@@ -31,10 +31,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: resp
-            duration: '60'
-          - target: memcache
-            duration: '30'
+          # TEMP: plain resp + memcache legs disabled to test the tiering leg in isolation.
+          # Restore by uncommenting the two entries below.
+          # - target: resp
+          #   duration: '60'
+          # - target: memcache
+          #   duration: '30'
           - target: resp
             duration: '60'
             tiering: 'true'
