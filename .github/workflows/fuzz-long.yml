@@ -16,6 +16,11 @@ on:
         required: false
         default: '30'
         type: string
+      tiering_duration:
+        description: 'Tiering RESP fuzzing duration in minutes'
+        required: false
+        default: '60'
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}
@@ -23,6 +28,7 @@ concurrency:
 
 jobs:
   fuzz-long:
+    name: fuzz-long (${{ matrix.target }}${{ matrix.suffix }})
     if: github.repository == 'dragonflydb/dragonfly'
     runs-on: CI-LARGE-86
     timeout-minutes: 120
@@ -31,14 +37,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # TEMP: plain resp + memcache legs disabled to test the tiering leg in isolation.
-          # Restore by uncommenting the two entries below.
-          # - target: resp
-          #   duration: '60'
-          # - target: memcache
-          #   duration: '30'
           - target: resp
             duration: '60'
+            duration_input: resp_duration
+          - target: memcache
+            duration: '30'
+            duration_input: memcache_duration
+          - target: resp
+            duration: '60'
+            duration_input: tiering_duration
             tiering: 'true'
             suffix: '-tiering'
 
@@ -60,7 +67,7 @@ jobs:
         with:
           mode: long
           target: ${{ matrix.target }}
-          duration-minutes: ${{ matrix.target == 'resp' && (github.event.inputs.resp_duration || matrix.duration) || (github.event.inputs.memcache_duration || matrix.duration) }}
+          duration-minutes: ${{ github.event.inputs[matrix.duration_input] || matrix.duration }}
           run-number: ${{ github.run_number }}
           tiering: ${{ matrix.tiering || 'false' }}
           artifact-suffix: ${{ matrix.suffix || '' }}
