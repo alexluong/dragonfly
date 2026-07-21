@@ -350,6 +350,41 @@ jobs:
           echo "Scenario 2: expected 4, got $THREADS"
           [ "$THREADS" -eq 4 ]
 
+  valkey-tcl-stream:
+    # Runs the upstream Valkey stream TCL suites (unit/type/stream[-cgroups]) against the built
+    # binary in external-server mode. Reuses the `dragonfly-binary` artifact from `build` (no
+    # rebuild). continue-on-error keeps it a canary for now — flip to a required gate once it is
+    # proven stable in CI. See tests/dragonfly/valkey_tcl/README.md.
+    # Pinned to 24.04: the runtime deps below install exact package versions (libboost-context1.83.0).
+    runs-on: ubuntu-24.04
+    needs: [build]
+    continue-on-error: true
+    # Must outlive the runner script's inner `timeout 900` plus checkout/install/clone overhead.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: dragonfly-binary
+          path: build
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          # tcl runs the harness; redis-tools for the readiness probe; libboost-context/libssl
+          # are the Release binary's runtime deps (same as the cgroup-thread-detection job).
+          sudo apt-get install -y --no-install-recommends \
+            tcl redis-tools libboost-context1.83.0 libssl3
+
+      - name: Run Valkey TCL stream tests
+        run: |
+          chmod +x build/dragonfly
+          ldd build/dragonfly || true
+          cd tests/dragonfly/valkey_tcl
+          ./sync-valkey-tcl-tests.sh
+          ./run-stream-tests.sh "${GITHUB_WORKSPACE}/build/dragonfly" 6399
+
   lint-test-chart:
     runs-on: ubuntu-latest
     needs: [build]
