@@ -148,12 +148,8 @@ struct StringSetWrapper {
     };
     do {
       curs = VisitSet(obj_, [&](auto* s) {
-        return s->Scan(static_cast<uint32_t>(curs), [&](auto key) {
-          if constexpr (std::is_same_v<decltype(key), sds>)
-            record(string_view{key, sdslen(key)});
-          else
-            record(key);
-        });
+        return s->Scan(static_cast<uint32_t>(curs),
+                       [&](const auto& key) { record(GetKeyView(key)); });
       });
     } while (curs && maxiterations-- && res->size() < count &&
              (base::CycleClock::Now() - start_cycles) < timeout_cycles);
@@ -162,8 +158,10 @@ struct StringSetWrapper {
 
   template <typename Cb> void ForEach(Cb&& cb) const {
     VisitSet(obj_, [&](auto* s) {
-      for (auto it = s->begin(); it != s->end(); ++it)
-        cb(Key(it));
+      for (auto it = s->begin(); it != s->end(); ++it) {
+        auto key = Key(it);
+        cb(GetKeyView(key));
+      }
     });
   }
 
@@ -314,9 +312,11 @@ void RandMemberUnique(const StringSetWrapper& strset, size_t count, cmn::BackedA
       auto it = s->GetRandomMember();
       if (it == s->end())
         break;
-      auto [_, inserted] = picks.insert(string{Key(it)});
+      auto key = Key(it);
+      const string_view key_view = GetKeyView(key);
+      auto [_, inserted] = picks.insert(string{key_view});
       if (inserted)
-        dest->PushArg(Key(it));
+        dest->PushArg(key_view);
     }
   });
 }
@@ -327,7 +327,8 @@ void RandMemberRepeat(const StringSetWrapper& strset, size_t count, cmn::BackedA
       auto it = s->GetRandomMember();
       if (it == s->end())
         break;
-      dest->PushArg(Key(it));
+      auto key = Key(it);
+      dest->PushArg(GetKeyView(key));
     }
   });
 }
@@ -1590,8 +1591,9 @@ void CmdSScan(CmdArgParser parser, CommandContext* cmd_cntx) {
   if (result.status() != OpStatus::WRONG_TYPE) {
     auto replier = [cursor, result = std::move(result)](facade::SinkReplyBuilder* builder) {
       auto* rb = static_cast<RedisReplyBuilder*>(builder);
+      std::string cursor_str = absl::StrCat(cursor);
       RedisReplyBuilder::ArrayScope scope{rb, 2};
-      rb->SendBulkString(absl::StrCat(cursor));
+      rb->SendBulkString(cursor_str);
       rb->SendBulkStrArr(*result);
     };
     cmd_cntx->ReplyWith(std::move(replier));
@@ -1602,10 +1604,9 @@ void CmdSScan(CmdArgParser parser, CommandContext* cmd_cntx) {
 
 // Syntax: saddex key [KEEPTTL] ttl_sec member [member...]
 void CmdSAddEx(CmdArgParser parser, CommandContext* cmd_cntx) {
-  constexpr uint32_t kMaxTtl = (1UL << 26);
   const std::string_view key = parser.Next<std::string_view>();
   const bool keepttl = parser.Check("KEEPTTL");
-  const uint32_t ttl_sec = parser.Next<FInt<1u, kMaxTtl>>();
+  const uint32_t ttl_sec = parser.Next<FInt<uint32_t{1}, uint32_t{kMaxExpireDeadlineSec}>>();
   ParsedArgs vals = parser.RemainingRange(WrongNumArgsError("SADDEX"));
 
   if (auto err = parser.TakeError(); err) {

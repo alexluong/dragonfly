@@ -13,7 +13,12 @@ import redis as base_redis
 from redis import asyncio as aioredis
 from redis.backoff import NoBackoff
 from redis.cache import CacheConfig
-from redis.exceptions import ConnectionError, ResponseError
+from redis.exceptions import (
+    AuthenticationError,
+    ConnectionError,
+    NoPermissionError,
+    ResponseError,
+)
 from redis.retry import Retry
 
 from . import dfly_args, dfly_multi_test_args
@@ -462,53 +467,122 @@ async def test_publish_stuck(df_server: DflyInstance, async_client: aioredis.Red
         await pub
 
 
-@pytest.mark.large
-@dfly_args({"proactor_threads": "4"})
-async def test_pubsub_busy_connections(df_server: DflyInstance):
-    sleep = 60
+async def _pubsub_backpressure_stats(df_server: DflyInstance) -> dict[str, int]:
+    # Read the pubsub_backpressure_events_total counter by its `event` label from the
+    # Prometheus /metrics endpoint. prometheus_client strips the `_total` suffix from the family.
+    metrics = await df_server.metrics()
+    family = metrics.get("dragonfly_pubsub_backpressure_events")
+    if family is None:
+        return {}
+    return {sample.labels["event"]: int(sample.value) for sample in family.samples}
 
-    async def sub_thread():
-        i = 0
 
-        async def sub_task():
-            nonlocal i
-            sleep_task = asyncio.create_task(asyncio.sleep(sleep))
-            while not sleep_task.done():
-                client = df_server.client()
-                pubsub = client.pubsub()
-                await pubsub.subscribe("channel")
-                # await pubsub.unsubscribe("channel")
-                i = i + 1
-                await client.close()
+async def _open_stuck_subscriber(port: int):
+    """Open a raw subscriber connection with a tiny receive buffer that stops reading, so the
+    server's Pub/Sub socket write blocks quickly once the subscriber falls behind."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    sock = writer.get_extra_info("socket")
+    # Cap the receive window so the server-side write blocks after only a few KB.
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)
 
-        subs = [asyncio.create_task(sub_task()) for _ in range(10)]
-        for s in subs:
-            await s
-        logging.debug(f"Exiting thread after {i} subscriptions")
+    writer.write(b"SUBSCRIBE channel\r\n")
+    await writer.drain()
+    # Read only the subscribe confirmation, then never read again -> stuck subscriber.
+    await reader.readexactly(1)
+    writer.transport.pause_reading()
+
+    return reader, writer
+
+
+# publish_buffer_limit is the soft limit; the hard limit is 4x that. It is large relative to the
+# subscriber's socket buffer, so the server write blocks (and the stall timer starts) well before
+# the soft limit is crossed.
+@dfly_args(
+    {
+        "proactor_threads": "1",
+        "publish_buffer_limit": "32mb",
+        "pubsub_slow_subscriber_timeout_ms": "100",
+    }
+)
+async def test_pubsub_slow_subscriber_closed(df_server: DflyInstance, async_client: aioredis.Redis):
+    reader, writer = await _open_stuck_subscriber(df_server.port)
+
+    stop = False
 
     async def pub_task():
-        pub = df_server.client()
-        i = 0
-        sleep_task = asyncio.create_task(asyncio.sleep(sleep))
-        while not sleep_task.done():
-            await pub.publish("channel", f"message-{i}")
-            i = i + 1
+        payload = "msg" * 1000
+        while not stop:
+            p = async_client.pipeline(transaction=False)
+            for _ in range(200):
+                p.publish("channel", payload)
+            await p.execute()
 
-    def run_in_thread():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(sub_thread())
+    publishers = [asyncio.create_task(pub_task()) for _ in range(20)]
 
-    threads = []
-    for _ in range(10):
-        thread = Thread(target=run_in_thread)
-        thread.start()
-        threads.append(thread)
+    # Wait until the policy force-closes the stuck subscriber.
+    stats = {}
+    for _ in range(150):
+        stats = await _pubsub_backpressure_stats(df_server)
+        if stats["forced_disconnect"] >= 1:
+            break
+        await asyncio.sleep(0.1)
 
-    await pub_task()
+    assert stats["soft_limit"] >= 1
+    assert stats["forced_disconnect"] >= 1
+    assert stats["messages_discarded"] >= 1
 
-    for thread in threads:
-        thread.join()
+    # Let the publishers finish - they must not stay parked once the budget was released.
+    stop = True
+    await asyncio.wait_for(asyncio.gather(*publishers), timeout=20)
+
+    # Drain the subscriber socket so the parked write completes and the connection closes through
+    # the normal shutdown path.
+    try:
+        while True:
+            data = await asyncio.wait_for(reader.read(65536), timeout=2)
+            if not data:
+                break
+    except asyncio.TimeoutError:
+        pass
+    writer.close()
+
+
+# With the timeout disabled (0), a stuck subscriber is never force-closed even under back-pressure.
+@dfly_args(
+    {
+        "proactor_threads": "1",
+        "publish_buffer_limit": "4mb",
+        "pubsub_slow_subscriber_timeout_ms": "0",
+    }
+)
+async def test_pubsub_slow_subscriber_disabled(
+    df_server: DflyInstance, async_client: aioredis.Redis
+):
+    reader, writer = await _open_stuck_subscriber(df_server.port)
+
+    async def pub_task():
+        payload = "msg" * 1000
+        p = async_client.pipeline(transaction=False)
+        for _ in range(2000):
+            p.publish("channel", payload)
+        await p.execute()
+
+    publishers = [asyncio.create_task(pub_task()) for _ in range(20)]
+
+    await asyncio.sleep(3)
+
+    stats = await _pubsub_backpressure_stats(df_server)
+    # The subscriber stays stuck: it is never force-closed and nothing is discarded.
+    assert stats["forced_disconnect"] == 0
+    assert stats["messages_discarded"] == 0
+
+    # Publishers are parked on the hard limit; closing the subscriber unblocks them.
+    writer.write(b"QUIT\r\n")
+    await writer.drain()
+    writer.close()
+
+    for pub in asyncio.as_completed(publishers):
+        await pub
 
 
 async def test_subscribers_with_active_publisher(df_server: DflyInstance, max_connections=100):
@@ -1066,6 +1140,229 @@ async def test_tls_insecure(with_ca_tls_server_args, with_tls_client_args, df_fa
 
     client = aioredis.Redis(port=server.port, **with_tls_client_args, ssl_cert_reqs=None)
     assert await client.dbsize() == 0
+
+
+@dfly_args({"proactor_threads": 4})
+async def test_reset(df_server: DflyInstance):
+    """RESET clears all dirty connection state while keeping the connection alive."""
+    cl = df_server.client(single_connection_client=True)
+    await cl.ping()
+    conn = cl.connection
+
+    # RESET returns a simple string "RESET".
+    await conn.send_command("RESET")
+    assert await conn.read_response() == "RESET"
+
+    # RESET aborts a MULTI block.
+    await conn.send_command("MULTI")
+    assert await conn.read_response() == "OK"
+    await conn.send_command("SET", "k", "v")
+    assert await conn.read_response() == "QUEUED"
+    await conn.send_command("RESET")
+    assert await conn.read_response() == "RESET"
+    # EXEC now fails because the transaction was discarded.
+    await conn.send_command("EXEC")
+    with pytest.raises(ResponseError, match="EXEC without MULTI"):
+        await conn.read_response()
+
+    # RESET switches back to DB 0.
+    await conn.send_command("SELECT", "1")
+    assert await conn.read_response() == "OK"
+    await conn.send_command("SET", "only_in_db1", "1")
+    assert await conn.read_response() == "OK"
+    await conn.send_command("RESET")
+    assert await conn.read_response() == "RESET"
+    await conn.send_command("EXISTS", "only_in_db1")
+    assert await conn.read_response() == 0  # not visible from DB 0
+
+    # RESET clears WATCH so a subsequent EXEC is not aborted by a concurrent write.
+    other = df_server.client()
+    await other.set("wk", "1")
+    await conn.send_command("WATCH", "wk")
+    assert await conn.read_response() == "OK"
+    await other.set("wk", "2")  # would normally dirty the watch
+    await conn.send_command("RESET")
+    assert await conn.read_response() == "RESET"
+    await conn.send_command("MULTI")
+    assert await conn.read_response() == "OK"
+    await conn.send_command("GET", "wk")
+    assert await conn.read_response() == "QUEUED"
+    await conn.send_command("EXEC")
+    assert await conn.read_response() == ["2"]  # EXEC succeeded, watch was cleared
+
+    await other.aclose()
+    await cl.aclose()
+
+
+@dfly_args({"proactor_threads": 4, "requirepass": "XXX"})
+async def test_reset_deauthenticates(df_server: DflyInstance):
+    """RESET drops authentication, requiring a new AUTH before further commands."""
+    cl = df_server.client(single_connection_client=True, password="XXX")
+    await cl.ping()
+    conn = cl.connection
+
+    await conn.send_command("RESET")
+    assert await conn.read_response() == "RESET"
+
+    # RESET is exempt from authentication
+    await conn.send_command("RESET")
+    assert await conn.read_response() == "RESET"
+
+    # After RESET the connection is no longer authenticated.
+    await conn.send_command("GET", "k")
+    with pytest.raises(AuthenticationError, match="Authentication required"):
+        await conn.read_response()
+
+    # Re-authenticating restores access.
+    await conn.send_command("AUTH", "XXX")
+    assert await conn.read_response() == "OK"
+    await conn.send_command("GET", "k")
+    assert await conn.read_response() is None
+
+    await cl.aclose()
+
+
+@dfly_args({"proactor_threads": 4})
+async def test_reset_restores_default_acl_identity(df_server: DflyInstance):
+    """On a connection without requirepass (req_auth is false), RESET must revert the ACL identity
+    to the default user, not keep the previously authenticated user's permissions."""
+    admin = df_server.client()
+    # Restricted user: may GET and RESET (via @read/@connection) but not SET.
+    await admin.execute_command(
+        "ACL", "SETUSER", "restricted", "on", ">pass", "+@read", "+@connection", "~*"
+    )
+
+    cl = df_server.client(single_connection_client=True)
+    await cl.ping()
+    conn = cl.connection
+
+    await conn.send_command("AUTH", "restricted", "pass")
+    assert await conn.read_response() == "OK"
+
+    # Restricted identity is active: SET is denied.
+    await conn.send_command("SET", "k", "v")
+    with pytest.raises(NoPermissionError):
+        await conn.read_response()
+
+    await conn.send_command("RESET")
+    assert await conn.read_response() == "RESET"
+
+    # After RESET the connection acts as the default user again: SET is allowed and
+    # ACL WHOAMI reports "default" (not the previously authenticated "restricted" user).
+    await conn.send_command("SET", "k", "v")
+    assert await conn.read_response() == "OK"
+    await conn.send_command("ACL", "WHOAMI")
+    assert await conn.read_response() == "User is default"
+
+    await admin.aclose()
+    await cl.aclose()
+
+
+@dfly_args({"proactor_threads": 4, "requirepass": "XXX", "pipeline_squash": 1})
+async def test_reset_stops_pipeline_squash(df_server: DflyInstance):
+    """RESET must end a squashed pipeline batch so commands after it are re-validated against the
+    post-RESET (deauthenticated) state, not the stale pre-RESET auth used when the batch was built.
+    """
+    client = df_server.client(password="XXX")
+    await client.set("k", "v")
+
+    # A single pipelined write: squashable GETs form a batch that RESET must terminate; the GET
+    # after RESET has to be rejected because the connection is now deauthenticated. redis-py raises
+    # NOAUTH (an AuthenticationError) while reading the pipeline responses. Without RESET ending the
+    # batch, that GET would be pre-validated under stale auth and wrongly return "v".
+    pipe = client.pipeline(transaction=False)
+    pipe.get("k")
+    pipe.get("k")
+    pipe.execute_command("RESET")
+    pipe.execute_command("GET", "k")
+    with pytest.raises(AuthenticationError, match="Authentication required"):
+        await pipe.execute()
+
+    await client.aclose()
+
+
+def _resp_cmd_writer(writer):
+    async def cmd(*args):
+        buf = ("*%d\r\n" % len(args)).encode()
+        for a in args:
+            a = str(a).encode()
+            buf += b"$%d\r\n%s\r\n" % (len(a), a)
+        writer.write(buf)
+        await writer.drain()
+
+    return cmd
+
+
+@dfly_args({"proactor_threads": 1})
+async def test_reset_clears_client_tracking(df_server: DflyInstance):
+    """RESET must restore a fresh-connection baseline for client-side caching: switch back to RESP2
+    and disable tracking so no invalidation PUSH is delivered for previously tracked keys. A stale
+    invalidation reaching a post-RESET (RESP2) connection would break the protocol."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", df_server.port)
+    cmd = _resp_cmd_writer(writer)
+
+    # HELLO on its own round-trip (pipelining races the protocol switch); the standalone map ends
+    # with the "role"/"master" pair.
+    await cmd("HELLO", "3")
+    await reader.readuntil(b"$6\r\nmaster\r\n")
+
+    await cmd("CLIENT", "TRACKING", "ON")
+    assert await reader.readuntil(b"\r\n") == b"+OK\r\n"
+    await cmd("GET", "k")  # start tracking key "k"
+    assert await reader.readuntil(b"\r\n") == b"_\r\n"  # RESP3 null
+
+    other = df_server.client()
+
+    # Sanity: while tracking is on (RESP3), a write to "k" delivers an invalidation PUSH.
+    await other.set("k", "v1")
+    push = await asyncio.wait_for(reader.readuntil(b"$1\r\nk\r\n"), timeout=2.0)
+    assert push.startswith(b">") and b"invalidate" in push
+
+    await cmd("RESET")
+    assert await reader.readuntil(b"\r\n") == b"+RESET\r\n"
+
+    # After RESET the connection is deauthed for tracking: a write to the previously tracked key
+    # must not produce any invalidation. The next frame the client sees must be the PONG.
+    await other.set("k", "v2")
+    await cmd("PING")
+    assert await reader.readuntil(b"\r\n") == b"+PONG\r\n"
+
+    await other.aclose()
+    writer.close()
+    await writer.wait_closed()
+
+
+@dfly_args({"proactor_threads": 1})
+async def test_invalidation_dropped_on_resp2_connection(df_server: DflyInstance):
+    """An invalidation can be generated for a connection that left RESP3 while tracking was still on
+    (RESET does exactly this - switches to RESP2 and disables tracking - but a queued invalidation
+    may still reach the async handler afterwards). The handler must drop such a message instead of
+    emitting a RESP3 PUSH, which would assert in debug builds and corrupt the RESP2 stream."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", df_server.port)
+    cmd = _resp_cmd_writer(writer)
+
+    await cmd("HELLO", "3")
+    await reader.readuntil(b"$6\r\nmaster\r\n")
+    await cmd("CLIENT", "TRACKING", "ON")
+    assert await reader.readuntil(b"\r\n") == b"+OK\r\n"
+    await cmd("GET", "k")  # track "k"
+    assert await reader.readuntil(b"\r\n") == b"_\r\n"
+
+    # Leave RESP3 while tracking is still enabled - now an invalidation for "k" targets a RESP2
+    # connection, the exact state RESET produces.
+    await cmd("HELLO", "2")
+    await reader.readuntil(b"$6\r\nmaster\r\n")
+
+    other = df_server.client()
+    await other.set("k", "v2")  # would-be invalidation must be dropped (connection is RESP2)
+
+    # No stray invalidation frame: the next reply is the PONG and the server did not crash.
+    await cmd("PING")
+    assert await reader.readuntil(b"\r\n") == b"+PONG\r\n"
+
+    await other.aclose()
+    writer.close()
+    await writer.wait_closed()
 
 
 async def test_tls_full_auth(with_ca_tls_server_args, with_ca_tls_client_args, df_factory):

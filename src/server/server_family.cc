@@ -328,7 +328,7 @@ std::shared_ptr<detail::SnapshotStorage> CreateCloudSnapshotStorage(std::string_
   } else if (detail::IsAzurePath(uri)) {
     auto azure = std::make_shared<detail::AzureSnapshotStorage>();
     auto ec = shard_set->pool()->GetNextProactor()->Await(
-        [&] { return azure->Init(detail::kBucketConnectMs); });
+        [&] { return azure->Init(uri, detail::kBucketConnectMs); });
     if (ec) {
       LOG(ERROR) << "Failed to initialize Azure snapshot storage: " << ec.message();
       exit(1);
@@ -391,9 +391,6 @@ void ClientInfo(facade::ParsedArgs args, CommandContext* cmd_cntx) {
   }
   auto* conn = cmd_cntx->conn();
   string info = conn->GetClientInfo();
-
-  // redis-py (5expects these fields. We append dummy values to keep the output parsable.
-  absl::StrAppend(&info, " db=", cmd_cntx->server_conn_cntx()->db_index(), "\r\n");
   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
   return rb->SendBulkString(info);
 }
@@ -963,6 +960,30 @@ bool IsMaster() {
     return true;
   }
   return ServerState::tlocal()->is_master;
+}
+
+void SendSaveHelp(RedisReplyBuilder* rb, bool is_bgsave) {
+  static constexpr string_view kSaveHelp[] = {
+      "DF",
+      "    Save in dragonfly-specific snapshotting format (default).",
+      "RDB",
+      "    Save in standard redis rdb format.",
+      "CLOUD_URI",
+      "    Specifies a cloud storage URI (s3://, gs://, azure://) to save the snapshot.",
+      "BASENAME",
+      "    The base filename for the snapshot files. <dbfilename> if omitted",
+  };
+
+  string format_line = is_bgsave ? "BGSAVE [SCHEDULE]" : "SAVE";
+  format_line.append(" [DF|RDB [CLOUD_URI [BASENAME]]]. Sub-options are:");
+  vector<string_view> help_arr{format_line};
+
+  if (is_bgsave) {
+    help_arr.emplace_back("SCHEDULE");
+    help_arr.emplace_back("    Optional. Parsed for client compatibility (no-op).");
+  }
+  help_arr.insert(help_arr.end(), begin(kSaveHelp), end(kSaveHelp));
+  rb->SendSimpleStrArr(help_arr);
 }
 
 }  // namespace
@@ -1626,6 +1647,17 @@ std::optional<ReplicaOffsetInfo> ServerFamily::GetReplicaOffsetInfo() {
     auto repl_ptr = replica_;
     CHECK(repl_ptr);
     return ReplicaOffsetInfo{repl_ptr->GetSyncId(), repl_ptr->GetReplicaOffset()};
+  }
+  return nullopt;
+}
+
+std::optional<int> ServerFamily::GetReplicaMasterSocketUnreadBytes() {
+  util::fb2::LockGuard lk(replicaof_mu_);
+
+  if (!IsMaster()) {
+    auto repl_ptr = replica_;
+    CHECK(repl_ptr);
+    return repl_ptr->GetMasterSocketUnreadBytes();
   }
   return nullopt;
 }
@@ -2400,13 +2432,18 @@ std::optional<SaveCmdOptions> ServerFamily::GetSaveCmdOpts(facade::ParsedArgs ar
   return save_cmd_opts;
 }
 
-// BGSAVE [SCHEDULE] [DF|RDB] [CLOUD_URI] [BASENAME]
+// BGSAVE [SCHEDULE] [DF|RDB] [CLOUD_URI [BASENAME] | BASENAME]
 void ServerFamily::BgSave(CmdArgParser parser, CommandContext* cmd_cntx) {
+  auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
   facade::ParsedArgs args = parser.UnparsedArgs();
   // SCHEDULE is parsed for client compatibility but is a no-op: concurrent
   // saves are still rejected by DoSaveCheckAndStart; we do not queue.
   if (!args.empty() && absl::EqualsIgnoreCase(args[0], "SCHEDULE")) {
     args = args.Tail();
+  }
+
+  if (!args.empty() && absl::EqualsIgnoreCase(args[0], "HELP")) {
+    return SendSaveHelp(rb, true);
   }
 
   auto maybe_res = GetSaveCmdOpts(args, cmd_cntx);
@@ -2424,12 +2461,17 @@ void ServerFamily::BgSave(CmdArgParser parser, CommandContext* cmd_cntx) {
   cmd_cntx->rb()->SendOk();
 }
 
-// SAVE [DF|RDB] [CLOUD_URI] [BASENAME]
+// SAVE [DF|RDB] [CLOUD_URI [BASENAME] | BASENAME]
 // Allows saving the snapshot of the dataset on disk, potentially overriding the format
 // and the snapshot name.
 void ServerFamily::Save(CmdArgParser parser, CommandContext* cmd_cntx) {
   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
-  auto maybe_res = GetSaveCmdOpts(parser.UnparsedArgs(), cmd_cntx);
+  facade::ParsedArgs args = parser.UnparsedArgs();
+  if (!args.empty() && absl::EqualsIgnoreCase(args[0], "HELP")) {
+    return SendSaveHelp(rb, false);
+  }
+
+  auto maybe_res = GetSaveCmdOpts(args, cmd_cntx);
   if (!maybe_res) {
     return;
   }
@@ -3420,11 +3462,13 @@ void ServerFamily::ReplTakeOver(facade::CmdArgParser parser, CommandContext* cmd
     return cmd_cntx->SendError("timeout is negative");
   }
 
+  // The LockGuard must precede the master check to ensure atomicity for the subsequent repl_ptr
+  // check
+  util::fb2::LockGuard lk(replicaof_mu_);
+
   // We return OK, to support idempotency semantics.
   if (IsMaster())
     return builder->SendOk();
-
-  util::fb2::LockGuard lk(replicaof_mu_);
 
   auto repl_ptr = replica_;
   CHECK(repl_ptr);
