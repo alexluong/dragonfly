@@ -645,6 +645,21 @@ class PipelineCacheSizeTracker {
 
 thread_local PipelineCacheSizeTracker tl_pipe_cache_sz_tracker;
 
+bool IsUnsubscribeCommand(const ParsedCommand* cmd) {
+  if (cmd == nullptr)
+    return false;
+
+  string_view name = cmd->Front();
+  return absl::EqualsIgnoreCase(name, "unsubscribe") ||
+         absl::EqualsIgnoreCase(name, "punsubscribe") ||
+         absl::EqualsIgnoreCase(name, "sunsubscribe");
+}
+
+bool HasQueuedPubMessages(const deque<Connection::MessageHandle>& messages) {
+  return any_of(messages.begin(), messages.end(),
+                [](const Connection::MessageHandle& msg) { return msg.IsPubMsg(); });
+}
+
 size_t Connection::MessageHandle::UsedMemory() const {
   struct MessageSize {
     size_t operator()(const PubMessagePtr& msg) {
@@ -2244,6 +2259,10 @@ void Connection::AsyncFiber() {
       if (parsed_head_ != nullptr) {
         prefer_pipeline_execution =
             quota_reached || (is_migration_req && (protocol_ == Protocol::REDIS));
+        if (prefer_pipeline_execution && parsed_head_ == parsed_to_execute_ &&
+            IsUnsubscribeCommand(parsed_head_) && HasQueuedPubMessages(dispatch_q_)) {
+          prefer_pipeline_execution = false;
+        }
       }
       if (dispatch_q_.empty() || prefer_pipeline_execution) {  // 2. Process pipeline Queue
         VLOG_IF(1, prefer_pipeline_execution)

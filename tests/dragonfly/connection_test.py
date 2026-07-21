@@ -494,6 +494,83 @@ async def _open_stuck_subscriber(port: int):
     return reader, writer
 
 
+async def _publish_to_stuck_subscriber(
+    async_client: aioredis.Redis,
+    batch_size: int,
+    *,
+    batches: int | None = None,
+    stop_event: asyncio.Event | None = None,
+):
+    payload = "msg" * 1000
+
+    while batches is None or batches > 0:
+        if stop_event is not None and stop_event.is_set():
+            break
+
+        p = async_client.pipeline(transaction=False)
+        for _ in range(batch_size):
+            p.publish("channel", payload)
+        await p.execute()
+
+        if batches is not None:
+            batches -= 1
+
+
+async def test_pubsub_stuck_subscriber_unsubscribe_then_ping(
+    df_server: DflyInstance, async_client: aioredis.Redis
+):
+    channel = "stuck_subscriber_control"
+    ping_marker = b"stuck-subscriber-ping"
+    payload = b"x" * (128 * 1024)
+    message_count = 248
+    pending_output_bytes = len(payload) * message_count
+    loop = asyncio.get_running_loop()
+    subscriber = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    subscriber.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)
+    subscriber.setblocking(False)
+    try:
+        await loop.sock_connect(subscriber, ("127.0.0.1", df_server.port))
+        await loop.sock_sendall(subscriber, f"SUBSCRIBE {channel}\r\n".encode())
+
+        subscribe_reply = b""
+        while not subscribe_reply.endswith(b":1\r\n"):
+            subscribe_reply += await loop.sock_recv(subscriber, 1024)
+
+        # The paused read side and small receive window leave this output pending on the server.
+        for _ in range(message_count):
+            assert await async_client.publish(channel, payload) == 1
+        assert pending_output_bytes >= 30 * 1024 * 1024
+
+        await loop.sock_sendall(
+            subscriber, f"UNSUBSCRIBE {channel}\r\nPING ".encode() + ping_marker + b"\r\n"
+        )
+
+        bytes_before_ping = 0
+        unsubscribe_received = False
+        ping_received = False
+        trailing = b""
+
+        async with async_timeout.timeout(20):
+            while not ping_received:
+                data = await loop.sock_recv(subscriber, 128 * 1024)
+                assert data, "subscriber connection closed before PING response"
+                bytes_before_ping += len(data)
+
+                reply = trailing + data
+                unsubscribe_received |= b"unsubscribe" in reply
+                ping_received = ping_marker in reply
+                trailing = reply[-len(ping_marker) + 1 :]
+
+        assert unsubscribe_received
+        assert bytes_before_ping >= pending_output_bytes
+        logging.info(
+            "Pub/Sub PING response arrived after draining %.2f MiB of stalled output",
+            bytes_before_ping / (1024 * 1024),
+        )
+    finally:
+        subscriber.close()
+
+
 # publish_buffer_limit is the soft limit; the hard limit is 4x that. It is large relative to the
 # subscriber's socket buffer, so the server write blocks (and the stall timer starts) well before
 # the soft limit is crossed.
@@ -507,17 +584,11 @@ async def _open_stuck_subscriber(port: int):
 async def test_pubsub_slow_subscriber_closed(df_server: DflyInstance, async_client: aioredis.Redis):
     reader, writer = await _open_stuck_subscriber(df_server.port)
 
-    stop = False
-
-    async def pub_task():
-        payload = "msg" * 1000
-        while not stop:
-            p = async_client.pipeline(transaction=False)
-            for _ in range(200):
-                p.publish("channel", payload)
-            await p.execute()
-
-    publishers = [asyncio.create_task(pub_task()) for _ in range(20)]
+    stop_event = asyncio.Event()
+    publishers = [
+        asyncio.create_task(_publish_to_stuck_subscriber(async_client, 200, stop_event=stop_event))
+        for _ in range(20)
+    ]
 
     # Wait until the policy force-closes the stuck subscriber.
     stats = {}
@@ -532,7 +603,7 @@ async def test_pubsub_slow_subscriber_closed(df_server: DflyInstance, async_clie
     assert stats["messages_discarded"] >= 1
 
     # Let the publishers finish - they must not stay parked once the budget was released.
-    stop = True
+    stop_event.set()
     await asyncio.wait_for(asyncio.gather(*publishers), timeout=20)
 
     # Drain the subscriber socket so the parked write completes and the connection closes through
@@ -560,14 +631,10 @@ async def test_pubsub_slow_subscriber_disabled(
 ):
     reader, writer = await _open_stuck_subscriber(df_server.port)
 
-    async def pub_task():
-        payload = "msg" * 1000
-        p = async_client.pipeline(transaction=False)
-        for _ in range(2000):
-            p.publish("channel", payload)
-        await p.execute()
-
-    publishers = [asyncio.create_task(pub_task()) for _ in range(20)]
+    publishers = [
+        asyncio.create_task(_publish_to_stuck_subscriber(async_client, 2000, batches=1))
+        for _ in range(20)
+    ]
 
     await asyncio.sleep(3)
 
